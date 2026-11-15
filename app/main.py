@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 
@@ -15,6 +16,8 @@ from .schemas import (
     BatchListResponse,
     BatchResponse,
     CancelResponse,
+    QuarantineRequest,
+    QuarantineResponse,
 )
 from .service import BatchService
 
@@ -23,6 +26,61 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 settings = get_settings()
 service = BatchService(settings)
+
+
+class TrackedFileResponse(FileResponse):
+    """带在途下载追踪的文件响应。
+
+    无论正常发完、客户端断开还是传输异常，__call__ 退出时都会注销下载句柄，
+    保证隔离接口等待的「在途下载」不会因为连接中断而永远不结束。
+    已开始的响应不会被中途取消，文件完整发完（能发多少发多少，不主动截断）。
+    可选分块节流（download_chunk_delay > 0）用于稳定复现在途下载场景。
+    """
+
+    def __init__(self, path, runtime, handle_id, on_finish, chunk_delay: float = 0.0,
+                 chunk_size: int | None = None, **kwargs):
+        super().__init__(path, **kwargs)
+        self._runtime = runtime
+        self._handle_id = handle_id
+        self._on_finish = on_finish
+        self._chunk_delay = chunk_delay
+        if chunk_size is not None:
+            self.chunk_size = chunk_size
+
+    async def _handle_simple(self, send, send_header_only: bool) -> None:
+        await send(
+            {"type": "http.response.start", "status": self.status_code,
+             "headers": self.raw_headers}
+        )
+        if send_header_only:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            return
+        if not self._chunk_delay:
+            # 不节流时与父类原生实现完全一致
+            await self._send_all(send)
+            return
+        async with await anyio.open_file(self.path, mode="rb") as file:
+            more_body = True
+            while more_body:
+                chunk = await file.read(self.chunk_size)
+                more_body = len(chunk) == self.chunk_size
+                await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+                if more_body:
+                    await anyio.sleep(self._chunk_delay)
+
+    async def _send_all(self, send) -> None:
+        async with await anyio.open_file(self.path, mode="rb") as file:
+            more_body = True
+            while more_body:
+                chunk = await file.read(self.chunk_size)
+                more_body = len(chunk) == self.chunk_size
+                await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._on_finish(self._runtime, self._handle_id)
 
 
 @asynccontextmanager
@@ -39,8 +97,10 @@ app = FastAPI(
         "测序双端数据按样本建批接收。R1、R2 各以请求体流式上传一次，"
         "单成员 gzip、严格四行制 FASTQ，两端条数与读段名逐对校验。"
         "坏包或校验失败整批拒收；单批文件字节上限接收过程中实时守限。"
+        "ready 批可被隔离：提交原因后立即阻断新的 R1/R2 下载，"
+        "等在途下载全部结束才确认隔离，原文件保留供追查，封锁持久化、重启不解除。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -82,11 +142,38 @@ async def cancel_batch(batch_id: str):
     return await service.cancel(batch_id)
 
 
+@app.post(
+    "/batches/{batch_id}/quarantine",
+    response_model=QuarantineResponse,
+    tags=["quarantine"],
+    summary="隔离 ready 批：立即阻断新下载，等在途下载结束后确认（原文件保留）",
+    responses={
+        404: {"description": "批次不存在"},
+        409: {"description": "批次非 ready（仅 ready 批可隔离）；隔离后重复调用返回既有结果"},
+        422: {"description": "请求体缺少 reason 或长度不合法"},
+    },
+)
+async def quarantine_batch(batch_id: str, payload: QuarantineRequest):
+    return await service.quarantine(batch_id, payload.reason)
+
+
 @app.get("/batches/{batch_id}/files/{role}/download", tags=["download"],
-         summary="下载展开后的 R1 / R2 FASTQ（仅 ready 批次）")
+         summary="下载展开后的 R1 / R2 FASTQ（仅 ready 批次；隔离后立即 409）",
+         responses={
+             409: {"description": "批次非 ready 或已隔离（quarantined 批新下载一律阻断）"},
+         })
 async def download_file(batch_id: str, role: FileRole):
-    path, filename = service.download_path(batch_id, role)
-    return FileResponse(path, media_type="text/plain", filename=filename)
+    path, filename, runtime, handle_id = await service.begin_download(batch_id, role)
+    return TrackedFileResponse(
+        path,
+        runtime,
+        handle_id,
+        service.finish_download,
+        chunk_delay=settings.download_chunk_delay,
+        chunk_size=settings.download_chunk_size,
+        media_type="text/plain",
+        filename=filename,
+    )
 
 
 @app.get("/health", tags=["system"], summary="健康检查")

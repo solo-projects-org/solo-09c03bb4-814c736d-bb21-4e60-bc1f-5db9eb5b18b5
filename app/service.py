@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from .database import get_conn, init_db
-from .models import BatchStatus, FileRole, utcnow_iso
+from .models import BatchRuntime, BatchStatus, FileRole, utcnow_iso
 from .storage import (
     BatchRegistry,
     QuotaExceededError,
@@ -19,7 +19,12 @@ from .storage import (
 )
 from .validation import StreamError, stream_gunzip, validate_fastq_pair, validate_fastq_structure
 
-TERMINAL_STATUSES = {BatchStatus.READY.value, BatchStatus.FAILED.value, BatchStatus.CANCELLED.value}
+TERMINAL_STATUSES = {
+    BatchStatus.READY.value,
+    BatchStatus.FAILED.value,
+    BatchStatus.CANCELLED.value,
+    BatchStatus.QUARANTINED.value,
+}
 
 
 class BatchService:
@@ -263,30 +268,136 @@ class BatchService:
         }
 
     # ------------------------------------------------------------------ #
-    # 下载
+    # 下载（沿用既有 GET .../download 接口，增加隔离准入与在途登记）
     # ------------------------------------------------------------------ #
-    def download_path(self, batch_id: str, role: FileRole) -> tuple[Path, str]:
+    async def begin_download(
+        self, batch_id: str, role: FileRole
+    ) -> tuple[Path, str, "BatchRuntime", str]:
+        """下载准入：仅 ready 批可下载。
+
+        与隔离共用同一把 download_lock，保证「状态检查 + 在途登记」原子：
+        一旦隔离把状态切到 quarantined，新的 R1/R2 下载立即 409，
+        而已经登记的下载不受影响，会完整发完不被截断。
+        """
+        runtime = await self.registry.create(batch_id)
+        async with runtime.download_lock:
+            row = self._row(batch_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="batch not found")
+            if row["status"] == BatchStatus.QUARANTINED.value:
+                raise HTTPException(
+                    status_code=409,
+                    detail="batch is quarantined, new downloads are blocked",
+                )
+            if row["status"] != BatchStatus.READY.value:
+                raise HTTPException(
+                    status_code=409, detail=f"batch is {row['status']}, not downloadable"
+                )
+            path = self._fastq_path(batch_id, role)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=f"{role.value} file missing on disk")
+            handle = runtime.register_download()
+            filename = f"{row['sample_id']}_{role.value}.fastq"
+            return path, filename, runtime, handle.id
+
+    async def finish_download(self, runtime: "BatchRuntime", handle_id: str) -> None:
+        """响应流结束（正常发完或客户端断开）后注销下载句柄。"""
+        runtime.finish_download(handle_id)
+
+    # ------------------------------------------------------------------ #
+    # 隔离
+    # ------------------------------------------------------------------ #
+    async def quarantine(self, batch_id: str, reason: str) -> dict:
+        """隔离 ready 批：先持久化封锁，再等在途下载全部结束后确认。
+
+        - 状态先落库为 quarantined：此后即使请求断开 / 服务重启也不会重新放行；
+        - 已开始的下载不截断，全部结束后才返回确认；
+        - 原文件全部保留供追查，配额按磁盘真实占用保留；
+        - 重复隔离返回既有隔离结果（幂等），同样等待在途下载清零。
+        """
         row = self._row(batch_id)
         if row is None:
             raise HTTPException(status_code=404, detail="batch not found")
-        if row["status"] != BatchStatus.READY.value:
-            raise HTTPException(status_code=409, detail=f"batch is {row['status']}, not downloadable")
-        path = self._fastq_path(batch_id, role)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail=f"{role.value} file missing on disk")
-        return path, f"{row['sample_id']}_{role.value}.fastq"
+
+        runtime = await self.registry.create(batch_id)
+        already = False
+
+        # 与下载准入同一临界区：封锁落库后，任何新下载都不可能再登记成功
+        async with runtime.download_lock:
+            current = self._row(batch_id)
+            if current["status"] == BatchStatus.QUARANTINED.value:
+                already = True
+            elif current["status"] != BatchStatus.READY.value:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"only ready batches can be quarantined, "
+                    f"batch is {current['status']}",
+                )
+            else:
+                now = utcnow_iso()
+                with get_conn(self.settings.db_path) as conn:
+                    cursor = conn.execute(
+                        "UPDATE batches SET status = ?, quarantine_reason = ?, "
+                        "quarantined_at = ?, updated_at = ? WHERE id = ? AND status = ?",
+                        (
+                            BatchStatus.QUARANTINED.value,
+                            reason[:1000],
+                            now,
+                            now,
+                            batch_id,
+                            BatchStatus.READY.value,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        refreshed = self._row(batch_id)
+                        if (
+                            refreshed is not None
+                            and refreshed["status"] == BatchStatus.QUARANTINED.value
+                        ):
+                            already = True
+                        else:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="batch state changed concurrently, quarantine aborted",
+                            )
+
+        # 封锁已持久化：即使本请求在此处断开，重启后批次仍是 quarantined。
+        # 等待隔离生效前已开始的下载全部结束，不把任何传输截成半份。
+        waited = await runtime.wait_downloads()
+
+        final = self._row(batch_id)
+        return {
+            "id": batch_id,
+            "status": BatchStatus.QUARANTINED,
+            "reason": final["quarantine_reason"],
+            "quarantined_at": final["quarantined_at"],
+            "already_quarantined": already,
+            "waited_downloads": waited,
+            "files_retained": directory_size(self._dir(batch_id)) > 0,
+            "message": (
+                "quarantine already in effect"
+                if already
+                else "new downloads blocked; all in-flight downloads finished, quarantine confirmed"
+            ),
+        }
 
     # ------------------------------------------------------------------ #
     # 重启恢复
     # ------------------------------------------------------------------ #
     async def recover_on_startup(self) -> dict:
-        """通过批保留；未完成批（receiving）一律判失败并回收磁盘后再对外服务。"""
+        """通过批/隔离批保留；未完成批（receiving）一律判失败并回收磁盘后再对外服务。"""
         # 同一 service 实例只恢复一次，避免测试中多个 ASGI 客户端重跑 lifespan 误判在途批
         if self._recovered:
-            return {"ready": 0, "aborted": 0, "orphaned": 0, "skipped": "already-recovered"}
+            return {
+                "ready": 0,
+                "aborted": 0,
+                "orphaned": 0,
+                "quarantined": 0,
+                "skipped": "already-recovered",
+            }
         self._recovered = True
         self.settings.batch_dir.mkdir(parents=True, exist_ok=True)
-        recovered = {"ready": 0, "aborted": 0, "orphaned": 0}
+        recovered = {"ready": 0, "aborted": 0, "orphaned": 0, "quarantined": 0}
 
         with get_conn(self.settings.db_path) as conn:
             rows = conn.execute("SELECT id, status FROM batches").fetchall()
@@ -298,6 +409,12 @@ class BatchService:
                 # 以磁盘真实文件为准重建配额账
                 await self.space.set_batch_usage(batch_id, directory_size(bdir))
                 recovered["ready"] += 1
+                continue
+            if status == BatchStatus.QUARANTINED.value:
+                # 封锁不因重启解除：文件原样保留供追查，仍按磁盘真实占用恢复配额，
+                # 状态保持 quarantined，下载接口继续拒绝
+                await self.space.set_batch_usage(batch_id, directory_size(bdir))
+                recovered["quarantined"] += 1
                 continue
             if status == BatchStatus.RECEIVING.value:
                 await asyncio.to_thread(remove_batch_files, bdir)

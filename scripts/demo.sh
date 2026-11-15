@@ -46,3 +46,13 @@ echo "下载正常批展开后的 R1（前 2 行）:"
 NORMAL_BID="$(curl -sS "$BASE/batches" | python3 -c \
   'import json,sys; print(next(b["id"] for b in json.load(sys.stdin)["batches"] if b["status"]=="ready"))')"
 curl -sS "$BASE/batches/$NORMAL_BID/files/R1/download" | head -n 2 || true
+
+echo
+echo "对正常批发起污染隔离（立即阻断新下载，原文件保留）:"
+curl -sS -X POST "$BASE/batches/$NORMAL_BID/quarantine" \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"demo: suspected contamination"}' | python3 -m json.tool
+echo "隔离后再次下载 R1（预期 409）:"
+curl -sS -o /tmp/fastq_q.json -w "HTTP %{http_code}\n" \
+  "$BASE/batches/$NORMAL_BID/files/R1/download" || true
+cat /tmp/fastq_q.json 2>/dev/null | python3 -m json.tool || true

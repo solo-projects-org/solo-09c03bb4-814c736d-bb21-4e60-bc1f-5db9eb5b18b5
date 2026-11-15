@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     # 上传过程中多久检查一次取消信号，避免客户端迟迟不发数据
     upload_idle_timeout: float = Field(default=15.0, gt=0)
 
+    # 下载响应每发送一块后的让出间隔（秒），0 表示不节流；测试用于稳定制造「在途下载」
+    download_chunk_delay: float = Field(default=0.0, ge=0)
+
+    # 下载节流时的分块字节数
+    download_chunk_size: int = Field(default=64 * 1024, ge=1)
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "app.db"

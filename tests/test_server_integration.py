@@ -39,6 +39,9 @@ def server():
         **os.environ,
         "FASTQ_DATA_DIR": str(data_dir),
         "FASTQ_BATCH_BYTE_LIMIT": str(64 * 1024 * 1024),
+        # 下载分块节流：稳定制造「在途下载」以验证隔离等待语义，生产默认 0 不节流
+        "FASTQ_DOWNLOAD_CHUNK_DELAY": "0.05",
+        "FASTQ_DOWNLOAD_CHUNK_SIZE": "32768",
         "PYTHONPATH": str(REPO_ROOT),
     }
     proc = subprocess.Popen(
@@ -261,3 +264,194 @@ def test_cancel_during_slow_upload_waits_and_cleans(server):
                    {"Content-Type": "application/gzip"})
     assert code == 409
     assert list(bdir.iterdir()) == []
+
+
+def _make_ready_batch(server, sample_id: str, n: int = 200, length: int = 80) -> str:
+    r1, r2 = _pair(n, length)
+    _, body = _req(server, "POST", "/batches", json.dumps({"sample_id": sample_id}).encode(),
+                   {"Content-Type": "application/json"})
+    bid = body["id"]
+    assert _req(server, "POST", f"/batches/{bid}/files/R1", _make_gz(r1),
+                {"Content-Type": "application/gzip"})[0] == 200
+    code, body = _req(server, "POST", f"/batches/{bid}/files/R2", _make_gz(r2),
+                      {"Content-Type": "application/gzip"})
+    assert code == 200 and body["status"] == "ready"
+    return bid
+
+
+def test_quarantine_waits_for_in_flight_download_then_blocks(server):
+    # 服务端下载分块节流（见 server fixture 的 FASTQ_DOWNLOAD_CHUNK_DELAY），
+    # 文件跨多个分块，普通读取即可稳定保持「在途」状态
+    bid = _make_ready_batch(server, "quar-inflight", n=20000)
+    bdir = server["data_dir"] / "batches" / bid
+    expected_files = {p.name for p in bdir.iterdir()}
+    file_size = (bdir / "R1.fastq").stat().st_size
+    assert file_size > 1_000_000
+
+    result: dict = {}
+    import threading
+
+    release_download = threading.Event()
+
+    def stalled_download():
+        req = urllib.request.Request(server["base"] + f"/batches/{bid}/files/R1/download")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                head = resp.read(4096)
+                result["status"] = resp.status
+                result["head"] = head
+                # 等主线程确认「隔离正在等待在途下载」后再抽干剩余数据
+                assert release_download.wait(timeout=20)
+                total = len(head)
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                result["bytes"] = total
+        except urllib.error.HTTPError as e:
+            result["status"] = e.code
+
+    t = threading.Thread(target=stalled_download)
+    t.start()
+    # 让服务端开始节流发送，响应进入在途状态
+    time.sleep(1.0)
+    assert t.is_alive(), "download should be in flight (server-side throttled)"
+
+    quarantine_result: dict = {}
+
+    def do_quarantine():
+        status, body = _req(server, "POST", f"/batches/{bid}/quarantine",
+                            json.dumps({"reason": "suspected contamination"}).encode(),
+                            {"Content-Type": "application/json"})
+        quarantine_result["status"] = status
+        quarantine_result["body"] = body
+
+    qt = threading.Thread(target=do_quarantine)
+    qt.start()
+    # 等隔离请求到达服务端并把封锁落库（响应尚未确认，因为下载仍在途）
+    detail = {}
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        _, detail = _req(server, "GET", f"/batches/{bid}")
+        if detail["status"] == "quarantined":
+            break
+        time.sleep(0.1)
+    assert detail["status"] == "quarantined", "封锁必须先落库"
+    assert qt.is_alive(), "在途下载未结束前，隔离不能确认"
+
+    # 封锁已生效：等待期间新的 R1/R2 下载立即 409
+    for role in ("R1", "R2"):
+        try:
+            urllib.request.urlopen(
+                server["base"] + f"/batches/{bid}/files/{role}/download", timeout=10
+            )
+            raise AssertionError("new download must be blocked once quarantine is in effect")
+        except urllib.error.HTTPError as e:
+            assert e.code == 409
+
+    # 释放在途下载，让它把剩余数据完整抽干（不被截断），随后隔离确认
+    release_download.set()
+    t.join(timeout=30)
+    assert not t.is_alive(), "download thread did not finish"
+    qt.join(timeout=30)
+    assert not qt.is_alive(), "quarantine did not confirm"
+
+    code, body = quarantine_result["status"], quarantine_result["body"]
+    assert code == 200, body
+    assert body["status"] == "quarantined"
+    assert body["already_quarantined"] is False
+    assert body["waited_downloads"] >= 1
+
+    # 在途下载拿到完整文件，没有被截成半份
+    assert result["status"] == 200
+    assert result["bytes"] == file_size
+
+    # 隔离确认后新的 R1/R2 下载立即被拒
+    for role in ("R1", "R2"):
+        try:
+            with urllib.request.urlopen(
+                server["base"] + f"/batches/{bid}/files/{role}/download", timeout=10
+            ):
+                raise AssertionError("download should have been blocked")
+        except urllib.error.HTTPError as e:
+            assert e.code == 409
+
+    # 原文件保留供追查
+    assert {p.name for p in bdir.iterdir()} == expected_files
+
+    # 重复隔离返回既有结果（幂等）
+    code, body = _req(server, "POST", f"/batches/{bid}/quarantine",
+                      json.dumps({"reason": "second call"}).encode(),
+                      {"Content-Type": "application/json"})
+    assert code == 200
+    assert body["already_quarantined"] is True
+    assert body["reason"] == "suspected contamination"
+    assert body["waited_downloads"] == 0
+
+    # 其他批不受影响，照常接收和下载
+    other = _make_ready_batch(server, "quar-other", n=10)
+    with urllib.request.urlopen(
+        server["base"] + f"/batches/{other}/files/R1/download", timeout=10
+    ) as resp:
+        assert resp.status == 200 and resp.read(1) == b"@"
+
+
+def test_quarantine_persists_across_restart(server):
+    bid = _make_ready_batch(server, "quar-restart", n=20)
+    bdir = server["data_dir"] / "batches" / bid
+    retained_size = (bdir / "R1.fastq").stat().st_size + (bdir / "R2.fastq").stat().st_size
+
+    code, _ = _req(server, "POST", f"/batches/{bid}/quarantine",
+                   json.dumps({"reason": "durable block"}).encode(),
+                   {"Content-Type": "application/json"})
+    assert code == 200
+
+    proc = server["proc"]
+    port = int(server["base"].rsplit(":", 1)[1])
+    proc.terminate()
+    proc.wait(timeout=15)
+
+    restarted = subprocess.Popen(
+        [
+            sys.executable, "-m", "uvicorn", "app.main:app",
+            "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning",
+        ],
+        cwd=REPO_ROOT,
+        env={**os.environ,
+             "FASTQ_DATA_DIR": str(server["data_dir"]),
+             "FASTQ_BATCH_BYTE_LIMIT": str(64 * 1024 * 1024),
+             "PYTHONPATH": str(REPO_ROOT)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    server["proc"] = restarted
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(server["base"] + "/health", timeout=1) as r:
+                if r.status == 200:
+                    break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        out = restarted.stdout.read() if restarted.stdout else ""
+        restarted.kill()
+        pytest.fail(f"restarted server did not come up:\n{out}")
+
+    # 重启不会重新放行：状态仍是 quarantined，下载继续被拒
+    _, detail = _req(server, "GET", f"/batches/{bid}")
+    assert detail["status"] == "quarantined"
+    assert detail["quarantine_reason"] == "durable block"
+
+    try:
+        with urllib.request.urlopen(
+            server["base"] + f"/batches/{bid}/files/R1/download", timeout=10
+        ):
+            raise AssertionError("quarantine must survive restart")
+    except urllib.error.HTTPError as e:
+        assert e.code == 409
+
+    # 文件仍保留，配额按磁盘真实占用恢复
+    assert (bdir / "R1.fastq").stat().st_size + (bdir / "R2.fastq").stat().st_size == retained_size
